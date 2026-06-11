@@ -41,7 +41,7 @@ import {
 } from 'n8n-workflow';
 import { v4 as uuid } from 'uuid';
 
-import { getErrorDescription, getErrorNodeId } from './utils';
+import { getErrorDescription, getErrorNodeId, getRequiredRedactionScopes } from './utils';
 import { WorkflowFinderService } from './workflow-finder.service';
 import { WorkflowHistoryService } from './workflow-history/workflow-history.service';
 
@@ -346,13 +346,33 @@ export class WorkflowService {
 			throw new BadRequestError('Cannot update an archived workflow.');
 		}
 
-		this.redactionEnforcementService.assertPolicyChangeAllowed(
+		await this.redactionEnforcementService.assertPolicyChangeAllowed(
 			workflow.settings?.redactionPolicy,
 			workflowUpdateData.settings?.redactionPolicy,
 		);
 
 		if (!forceSave && expectedChecksum) {
 			await this._detectConflicts(workflow, expectedChecksum);
+		}
+
+		// check credentials for old format - scope to the workflow's owner project
+		const ownerProject = await this.ownershipService.getWorkflowProjectCached(workflowId);
+		await WorkflowHelpers.replaceInvalidCredentials(workflowUpdateData, ownerProject.id);
+
+		// Central credential guard for every workflow write path. With sharing
+		// enabled, reject new nodes that reference credentials the acting user
+		// cannot access and revert edits to existing read-only credential nodes.
+		// Runs after replaceInvalidCredentials so old-format/name references are
+		// already resolved to IDs before the check.
+		// Loaded lazily to avoid a circular import (workflow.service.ee pulls in
+		// folder/project services which import this module).
+		if (this.licenseState.isSharingLicensed()) {
+			const { EnterpriseWorkflowService } = await import('./workflow.service.ee');
+			await Container.get(EnterpriseWorkflowService).preventTampering(
+				workflowUpdateData,
+				workflowId,
+				user,
+			);
 		}
 
 		// Update the workflow's version when changing nodes, connections, or nodeGroups
@@ -384,10 +404,6 @@ export class WorkflowService {
 			workflowUpdateData.versionId = workflow.versionId;
 		}
 
-		// check credentials for old format - scope to the workflow's owner project
-		const ownerProject = await this.ownershipService.getWorkflowProjectCached(workflowId);
-		await WorkflowHelpers.replaceInvalidCredentials(workflowUpdateData, ownerProject.id);
-
 		WorkflowHelpers.addNodeIds(workflowUpdateData);
 		WorkflowHelpers.resolveNodeWebhookIds(workflowUpdateData, this.nodeTypes);
 		WorkflowHelpers.validateWorkflowStructure({
@@ -408,13 +424,18 @@ export class WorkflowService {
 			delete workflowUpdateData.settings.redactionPolicy;
 		}
 
-		// Strip redactionPolicy if user lacks scope and value is changing
+		// Strip redactionPolicy if user lacks the required directional scope
 		if (
 			workflowUpdateData.settings?.redactionPolicy !== undefined &&
 			workflowUpdateData.settings.redactionPolicy !== workflow.settings?.redactionPolicy
 		) {
-			const canUpdate = await userHasScopes(user, ['workflow:updateRedactionSetting'], false, {
-				workflowId,
+			const requiredScopes = getRequiredRedactionScopes(
+				workflow.settings?.redactionPolicy,
+				workflowUpdateData.settings.redactionPolicy,
+			);
+
+			const canUpdate = await userHasScopes(user, requiredScopes, false, {
+				projectId: ownerProject.id,
 			});
 			if (!canUpdate) {
 				delete workflowUpdateData.settings.redactionPolicy;
@@ -451,6 +472,16 @@ export class WorkflowService {
 		// Validate pinData size after all mutations are applied
 		if ('pinData' in workflowUpdateData) {
 			WorkflowHelpers.validatePinDataSize({ ...workflow, ...workflowUpdateData });
+		}
+
+		// Reject illegal credential-to-node bindings before persisting
+		const restrictionValidation = this.workflowValidationService.validateCredentialNodeRestrictions(
+			workflowUpdateData.nodes ?? workflow.nodes,
+		);
+		if (!restrictionValidation.isValid) {
+			throw new WorkflowValidationError(
+				restrictionValidation.error ?? 'Credential binding is not allowed.',
+			);
 		}
 
 		// Run external hook after all validation has passed, right before persisting
@@ -573,6 +604,25 @@ export class WorkflowService {
 			await this.activeWorkflowManager.add(workflowId, mode);
 			didPublish = true;
 		} catch (error) {
+			// Activation failed partway through. It may already have registered triggers
+			// e.g. a Schedule Trigger before throwing; this ensures they get deregistered,
+			// which otherwise may cause them to start unintended executions.
+			// Done before the rollback below so the active version is still
+			// resolvable by `clearWebhooks`.
+			try {
+				await this.activeWorkflowManager.remove(workflowId);
+
+				this.logger.warn(
+					`Rolled back partial activation of workflow "${workflowId}"; triggers deregistered`,
+					{ workflowId },
+				);
+			} catch (cleanupError) {
+				this.logger.error(`Failed to roll back partial activation of workflow "${workflowId}"`, {
+					workflowId,
+					error: cleanupError,
+				});
+			}
+
 			const rollbackPayload = {
 				active: false,
 				activeVersionId: null,

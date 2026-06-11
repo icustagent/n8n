@@ -20,6 +20,7 @@ import { CredentialApiHelper } from './credential-api-helper';
 import { DynamicCredentialApiHelper } from './dynamic-credential-api-helper';
 import { ExternalSecretsApiHelper } from './external-secrets-api-helper';
 import { McpApiHelper } from './mcp-api-helper';
+import { McpOAuthApiHelper } from './mcp-oauth-api-helper';
 import { ProjectApiHelper } from './project-api-helper';
 import { PublicApiHelper } from './public-api-helper';
 import { RoleApiHelper } from './role-api-helper';
@@ -38,6 +39,13 @@ export interface LoginResponseData {
 export interface InstanceAiBackgroundTimeoutSimulation {
 	threadId: string;
 	timeoutAt: number;
+}
+
+export interface InstanceAiThreadStatus {
+	backgroundTasks: Array<{
+		taskId?: string;
+		status?: string;
+	}>;
 }
 
 export type UserRole = 'owner' | 'admin' | 'member' | 'chat';
@@ -60,6 +68,7 @@ export class ApiHelpers {
 	workflows: WorkflowApiHelper;
 	webhooks: WebhookApiHelper;
 	mcp: McpApiHelper;
+	mcpOauth: McpOAuthApiHelper;
 	projects: ProjectApiHelper;
 	credentials: CredentialApiHelper;
 	dynamicCredentials: DynamicCredentialApiHelper;
@@ -77,6 +86,7 @@ export class ApiHelpers {
 		this.workflows = new WorkflowApiHelper(this);
 		this.webhooks = new WebhookApiHelper(this);
 		this.mcp = new McpApiHelper(this);
+		this.mcpOauth = new McpOAuthApiHelper(this);
 		this.projects = new ProjectApiHelper(this);
 		this.credentials = new CredentialApiHelper(this);
 		this.dynamicCredentials = new DynamicCredentialApiHelper(this);
@@ -337,6 +347,18 @@ export class ApiHelpers {
 		return body.data.thread;
 	}
 
+	async getInstanceAiThreadStatus(threadId: string): Promise<InstanceAiThreadStatus> {
+		const response = await this.request.get(`/rest/instance-ai/threads/${threadId}/status`);
+		if (!response.ok()) {
+			throw new TestError(
+				`GET /rest/instance-ai/threads/${threadId}/status failed (${response.status()}): ${await response.text()}`,
+			);
+		}
+
+		const body = (await response.json()) as { data?: Partial<InstanceAiThreadStatus> };
+		return { backgroundTasks: body.data?.backgroundTasks ?? [] };
+	}
+
 	async startInstanceAiBackgroundTimeoutSimulation(
 		userId: string,
 		threadId?: string,
@@ -352,6 +374,17 @@ export class ApiHelpers {
 
 		const body = (await response.json()) as { data: InstanceAiBackgroundTimeoutSimulation };
 		return body.data;
+	}
+
+	async cancelInstanceAiTask(threadId: string, taskId: string): Promise<void> {
+		const response = await this.request.post(
+			`/rest/instance-ai/chat/${threadId}/tasks/${taskId}/cancel`,
+		);
+		if (!response.ok()) {
+			throw new TestError(
+				`POST /rest/instance-ai/chat/${threadId}/tasks/${taskId}/cancel failed (${response.status()}): ${await response.text()}`,
+			);
+		}
 	}
 
 	async runInstanceAiLivenessSweep(now?: number): Promise<void> {

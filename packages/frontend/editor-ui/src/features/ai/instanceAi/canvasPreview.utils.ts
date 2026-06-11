@@ -115,56 +115,9 @@ export function getLatestWorkflowSetupResult(
 	return undefined;
 }
 
-export interface LatestExecution {
-	executionId: string;
-	workflowId: string;
-}
-
-/**
- * Walks an agent tree depth-first (most recent last) and returns the executionId
- * and workflowId from the latest completed run-workflow tool result.
- *
- * The workflowId preference order is:
- *   1. The sibling build-workflow tool's result.workflowId (always the real
- *      current-run ID, since build-workflow hits the live backend).
- *   2. The run-workflow tool call's args.workflowId (falls back for flows that
- *      run a pre-existing workflow without building it first).
- *
- * This ordering matters for trace-replay: the cached LLM's args.workflowId
- * carries the ID from the original recording, but build-workflow's result
- * always reflects the real workflow created during replay.
- */
-export function getLatestExecutionId(node: InstanceAiAgentNode): LatestExecution | undefined {
-	for (let i = node.children.length - 1; i >= 0; i--) {
-		const childResult = getLatestExecutionId(node.children[i]);
-		if (childResult) return childResult;
-	}
-	for (let i = node.toolCalls.length - 1; i >= 0; i--) {
-		const tc = node.toolCalls[i];
-		if (
-			tc.toolName === 'executions' &&
-			(tc.args as Record<string, unknown> | undefined)?.action === 'run' &&
-			!tc.isLoading &&
-			tc.result &&
-			typeof tc.result === 'object'
-		) {
-			const result = tc.result as Record<string, unknown>;
-			if (typeof result.executionId !== 'string') continue;
-
-			const buildResult = getLatestBuildResult(node);
-			const args = tc.args as Record<string, unknown> | undefined;
-			const workflowId =
-				buildResult?.workflowId ??
-				(typeof args?.workflowId === 'string' ? args.workflowId : undefined);
-			if (!workflowId) continue;
-
-			return { executionId: result.executionId, workflowId };
-		}
-	}
-	return undefined;
-}
-
-const DATA_TABLE_MUTATION_ACTIONS = new Set([
+const DATA_TABLE_PREVIEW_ACTIONS = new Set([
+	'schema',
+	'query',
 	'create',
 	'insert-rows',
 	'update-rows',
@@ -174,8 +127,10 @@ const DATA_TABLE_MUTATION_ACTIONS = new Set([
 	'rename-column',
 ]);
 
-/** Per-action check that the result indicates a successful mutation. */
+/** Per-action check that the result contains a table reference worth previewing. */
 const RESULT_VALIDATORS: Record<string, (result: Record<string, unknown>) => boolean> = {
+	schema: (r) => Array.isArray(r.columns),
+	query: (r) => Array.isArray(r.data),
 	'insert-rows': (r) => typeof r.insertedCount === 'number',
 	'update-rows': (r) => typeof r.updatedCount === 'number',
 	'add-column': (r) => r.column !== null && r.column !== undefined && typeof r.column === 'object',
@@ -198,8 +153,9 @@ function extractDataTableId(
 	}
 
 	const isValid = RESULT_VALIDATORS[action];
-	if (isValid?.(result) && typeof args?.dataTableId === 'string') {
-		return args.dataTableId;
+	if (isValid?.(result)) {
+		if (typeof result.dataTableId === 'string') return result.dataTableId;
+		if (typeof args?.dataTableId === 'string') return args.dataTableId;
 	}
 
 	return undefined;
@@ -244,7 +200,7 @@ export function getLatestDataTableResult(node: InstanceAiAgentNode): DataTableRe
 		const action = typeof args?.action === 'string' ? args.action : '';
 		if (
 			tc.toolName === 'data-tables' &&
-			DATA_TABLE_MUTATION_ACTIONS.has(action) &&
+			DATA_TABLE_PREVIEW_ACTIONS.has(action) &&
 			!tc.isLoading &&
 			tc.result &&
 			typeof tc.result === 'object'
