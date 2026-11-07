@@ -1,14 +1,117 @@
+
 services:
-  postgres:
-    image: ${TEST_IMAGE_POSTGRES:?set it from packages/quality/environments/containers/postgres-versions.json}
-    restart: always
-    environment:
-      - POSTGRES_DB=n8n
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=password
+  n8n:
+    image: "n8nio/n8n:latest"
+    container_name: n8n
+    restart: unless-stopped
     ports:
-      - 5432:5432
-    # Not PGDATA: Postgres 18+ moved it under /var/lib/postgresql/<major>/ and
-    # refuses to start when /var/lib/postgresql/data is mounted.
-    tmpfs:
-      - /var/lib/postgresql
+      - "5678:5678"
+    env_file:
+      - path: /etc/dokploy/n8n-runtime/n8n.env
+        format: raw
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - default
+      - n8nnetwork
+      - apinetwork
+      - dokploy-network
+    depends_on:
+      - n8npostgres
+      - n8nredis
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  n8npostgres:
+    image: "postgres:18-alpine"
+    container_name: n8npostgres
+    restart: unless-stopped
+    env_file:
+      - path: /etc/dokploy/n8n-runtime/postgres.env
+        format: raw
+    volumes:
+      - postgres_root:/var/lib/postgresql
+      - postgres_legacy:/var/lib/postgresql/data
+    networks:
+      - n8nnetwork
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgresdb -d postgresdb"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  n8nredis:
+    image: "redis:8-alpine"
+    container_name: n8nredis
+    restart: unless-stopped
+    env_file:
+      - path: /etc/dokploy/n8n-runtime/redis.env
+        format: raw
+    command:
+      - sh
+      - -ec
+      - 'exec docker-entrypoint.sh redis-server --requirepass "$$REDIS_PASSWORD" --maxmemory 256mb --maxmemory-policy allkeys-lru'
+    volumes:
+      - redis_data:/data
+    networks:
+      - n8nnetwork
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -qx PONG"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  n8n_data:
+    external: true
+    name: aiagent-n8n-yf9bjk_n8n_data
+
+  postgres_root:
+    external: true
+    name: d37a93fe34eb0ced5b24d709eedb0f0ff71a351e55e48f6bb983dd85c4d40f84
+
+  postgres_legacy:
+    external: true
+    name: aiagent-n8n-yf9bjk_n8npostgres_data
+
+  redis_data:
+    external: true
+    name: aiagent-n8n-yf9bjk_n8nredis_data
+
+networks:
+  default:
+    external: true
+    name: aiagent-n8n-yf9bjk_default
+
+  n8nnetwork:
+    external: true
+    name: n8nnetwork
+
+  apinetwork:
+    external: true
+    name: apinetwork
+
+  dokploy-network:
+    external: true
+    name: dokploy-network
